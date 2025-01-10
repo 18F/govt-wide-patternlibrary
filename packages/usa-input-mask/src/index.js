@@ -1,5 +1,6 @@
 const selectOrMatches = require("../../uswds-core/src/js/utils/select-or-matches");
 const behavior = require("../../uswds-core/src/js/utils/behavior");
+const debounce = require("../../uswds-core/src/js/utils/debounce");
 const { prefix: PREFIX } = require("../../uswds-core/src/js/config");
 
 const MASKED_CLASS = `${PREFIX}-masked`;
@@ -7,18 +8,90 @@ const MASKED = `.${MASKED_CLASS}`;
 const MASK = `${PREFIX}-input-mask`;
 const MASK_CONTENT = `${MASK}--content`;
 const PLACEHOLDER = "placeholder";
+const SR_ONLY_CLASS = `${PREFIX}-sr-only`;
+const ERROR_MESSAGE_CLASS = `${PREFIX}-error-message`;
+const ERROR_MESSAGE_DEFAULT = "Error: please enter a valid character";
+const ERROR_MESSAGE_SR_DEFAULT = "Error: please enter a valid character";
+const ERROR_MESSAGE_FULL_DEFAULT = "Maximum character count reached";
+const ERROR_MESSAGE_FULL_SR_DEFAULT = "Maximum character count reached";
+const ERROR_MESSAGE_ALPHA_DEFAULT = "Error: please enter a letter";
+const ERROR_MESSAGE_ALPHA_SR_DEFAULT = "Error: please enter a letter";
+const ERROR_MESSAGE_NUMERIC_DEFAULT = "Error: please enter a number";
+const ERROR_MESSAGE_NUMERIC_SR_DEFAULT = "Error: please enter a number";
+
+let errorMessageEl;
+let errorMessageSrOnlyEl;
+let lastValueLength;
+let keyPressed;
+let shiftComboPressed;
+let inputAddedByPaste;
+let backspacePressed;
 
 // User defined Values
 const maskedNumber = "_#dDmMyY9";
 const maskedLetter = "A";
 
-// replaces each masked input with a shell containing the input and it's mask.
+const getMaskInputContext = (el) => {
+  const inputEl = el;
+
+  if (!inputEl) {
+    throw new Error(`Element is missing outer ${inputEl}`);
+  }
+
+  const inputId = inputEl.id;
+  const errorId = `${inputId}Error`;
+  const errorMsg =
+    inputEl.getAttribute("data-errorMessage") || ERROR_MESSAGE_DEFAULT;
+  const errorMsgAlpha =
+    inputEl.getAttribute("data-errorMessageAlphabetical") ||
+    ERROR_MESSAGE_ALPHA_DEFAULT;
+  const errorMsgNum =
+    inputEl.getAttribute("data-errorMessageNumerical") ||
+    ERROR_MESSAGE_NUMERIC_DEFAULT;
+  const errorMsgFull =
+    inputEl.getAttribute("data-errorMessageInputFull") ||
+    ERROR_MESSAGE_FULL_DEFAULT;
+  const errorMsgSrOnly =
+    inputEl.getAttribute("data-errorMessageSrOnly") || ERROR_MESSAGE_SR_DEFAULT;
+  const errorMsgAlphaSrOnly =
+    inputEl.getAttribute("data-errorMessageAlphabeticalSrOnly") ||
+    ERROR_MESSAGE_ALPHA_SR_DEFAULT;
+  const errorMsgNumSrOnly =
+    inputEl.getAttribute("data-errorMessageNumericalSrOnly") ||
+    ERROR_MESSAGE_NUMERIC_SR_DEFAULT;
+  const errorMsgFullSrOnly =
+    inputEl.getAttribute("data-errorMessageInputFullSrOnly") ||
+    ERROR_MESSAGE_FULL_SR_DEFAULT;
+
+  return {
+    inputEl,
+    errorId,
+    inputId,
+    errorMsg,
+    errorMsgAlpha,
+    errorMsgNum,
+    errorMsgFull,
+    errorMsgSrOnly,
+    errorMsgAlphaSrOnly,
+    errorMsgNumSrOnly,
+    errorMsgFullSrOnly,
+  };
+};
+
+/**
+ *  Replaces each masked input with a shell containing the input and it's mask.
+ *
+ * @param {HTMLElement} input - The input element
+ */
 const createMaskedInputShell = (input) => {
   const placeholder = input.getAttribute(`${PLACEHOLDER}`);
   if (placeholder) {
     input.setAttribute("maxlength", placeholder.length);
     input.setAttribute("data-placeholder", placeholder);
     input.removeAttribute(`${PLACEHOLDER}`);
+    input.addEventListener("paste", () => {
+      inputAddedByPaste = true;
+    });
   } else {
     return;
   }
@@ -38,13 +111,20 @@ const createMaskedInputShell = (input) => {
   shell.appendChild(input);
 };
 
+/**
+ *  Returns a combination of the input value and what is left of the placeholder inside the new element.
+ *
+ * @param {HTMLElement} inputEl - The input element
+ */
 const setValueOfMask = (el) => {
   const { value } = el;
   const placeholderVal = `${el.dataset.placeholder.substr(value.length)}`;
+  const inputValueLength = placeholderVal.length + value.length;
 
   const theIEl = document.createElement("i");
   theIEl.textContent = value;
-  return [theIEl, placeholderVal];
+
+  return [theIEl, placeholderVal, inputValueLength];
 };
 
 const strippedValue = (isCharsetPresent, value) =>
@@ -54,11 +134,54 @@ const isInteger = (value) => !Number.isNaN(parseInt(value, 10));
 
 const isLetter = (value) => (value ? value.match(/[A-Z]/i) : false);
 
+/**
+ *  Creates an array of what the required character type is expected to be for each character in the complete input value.
+ *  Checks what the current index is to return the current required character type.
+ *
+ * @param {string} placeholder - String of placeholder letters or numbers that defines what the mask is expecting
+ * @param {string} value - Input mask value (including the newest input attempt even if it will be rejected)
+ */
+const checkMaskType = (placeholder, value) => {
+  const array = [];
+  const valueLength = value.length;
+  let matchType;
+
+  for (let i = 0; i < placeholder.length; i += 1) {
+    const matchesNumber = maskedNumber.indexOf(placeholder[i]) >= 0;
+    const matchesLetter = maskedLetter.indexOf(placeholder[i]) >= 0;
+
+    if (matchesNumber) {
+      array.push("number");
+    } else if (matchesLetter) {
+      array.push("letter");
+    } else {
+      // keep note of where format characters are (hyphens, spaces, etc) so index is always accurate
+      array.push("format character");
+    }
+  }
+
+  matchType = array[valueLength - 1];
+
+  // if index lands on a "format character" forward to next matchType in array
+  if (matchType === "format character") {
+    matchType = array[valueLength];
+  }
+
+  return { matchType };
+};
+
+/**
+ *  Checks if the new input character meets mask requirement.
+ *  Returns the new input value with the new character added if it's accepted.
+ *
+ * @param {HTMLElement} el - The input element
+ */
 const handleCurrentValue = (el) => {
   const isCharsetPresent = el.dataset.charset;
   const placeholder = isCharsetPresent || el.dataset.placeholder;
   const { value } = el;
   const len = placeholder.length;
+  const { matchType } = checkMaskType(placeholder, value);
   let newValue = "";
   let i;
   let charIndex;
@@ -82,7 +205,7 @@ const handleCurrentValue = (el) => {
       (isCharsetPresent &&
         ((matchesLetter && !isLet) || (matchesNumber && !isInt)))
     ) {
-      return newValue;
+      return { newValue, matchType };
     } else {
       newValue += placeholder[i];
     }
@@ -91,25 +214,209 @@ const handleCurrentValue = (el) => {
       break;
     }
   }
-
-  return newValue;
+  return { newValue, matchType };
 };
 
-const handleValueChange = (el) => {
-  const inputEl = el;
-  const id = inputEl.getAttribute("id");
-  inputEl.value = handleCurrentValue(inputEl);
+/**
+ * Triggers the error message announcement for screen readers after a 1000ms delay.
+ *
+ * @param {HTMLElement} msgEl - The screen reader error message element
+ * @param {boolean} status - A boolean of error's hidden status
+ */
+const srUpdateErrorStatus = debounce((msgEl, status) => {
+  const srStatusMessage = msgEl;
+  srStatusMessage.hidden = status;
+}, 1000);
 
-  const maskVal = setValueOfMask(el);
-  const maskEl = document.getElementById(`${id}Mask`);
+/**
+ * Updates the error message text content for screen readers after a 1000ms delay.
+ *
+ * @param {HTMLElement} msgEl - The screen reader error message element
+ * @param {string} errorMsg - A string of the error message
+ */
+const srUpdateErrorMsg = debounce((msgEl, errorMsg) => {
+  const srStatusMessage = msgEl;
+  srStatusMessage.textContent = errorMsg;
+}, 1000);
+
+/**
+ * Creates the sr only and visual error messages, handles their hidden status and content.
+ *
+ * @param {string} valueAttempt - The input value before the new character is accepted or rejected
+ * @param {string} newValue - The input value after the new character is accepted or rejected
+ * @param {string} matchType - The character type that the input should be to be accepted
+ * @param {HTMLElement} inputEl - The input element
+ * @param {boolean} maxLengthReached - Returns true when the input mask is at max length
+ */
+const handleErrorState = (
+  valueAttempt,
+  newValue,
+  matchType,
+  inputEl,
+  maxLengthReached,
+) => {
+  const {
+    errorId,
+    errorMsg,
+    errorMsgNum,
+    errorMsgAlpha,
+    errorMsgFull,
+    errorMsgSrOnly,
+    errorMsgNumSrOnly,
+    errorMsgAlphaSrOnly,
+    errorMsgFullSrOnly,
+  } = getMaskInputContext(inputEl);
+
+  // check if the new character was a format character added by the mask
+  const lastChar = newValue.charAt(newValue.length - 1);
+  const formatCharAdded = lastChar === keyPressed;
+
+  // create visual error message and add to DOM
+  if (!document.getElementById(errorId)) {
+    const errorMsgSpan = document.createElement("span");
+    errorMsgSpan.setAttribute("id", errorId);
+    errorMsgSpan.setAttribute("class", ERROR_MESSAGE_CLASS);
+    errorMsgSpan.setAttribute("aria-hidden", "true");
+    inputEl.parentNode.appendChild(errorMsgSpan);
+    errorMessageEl = document.getElementById(errorId);
+
+    // create sr only error message and add to DOM
+    const errorMsgSpanSrOnly = document.createElement("span");
+    errorMsgSpanSrOnly.setAttribute("id", `${errorId}SrOnly`);
+    errorMsgSpanSrOnly.setAttribute("class", SR_ONLY_CLASS);
+    errorMsgSpanSrOnly.setAttribute("role", "alert");
+    inputEl.parentNode.appendChild(errorMsgSpanSrOnly);
+    errorMessageSrOnlyEl = document.getElementById(`${errorId}SrOnly`);
+  }
+
+  const messageType = maxLengthReached ? "input full" : matchType;
+
+  // hide or show error message
+  if (maxLengthReached) {
+    // max length reached
+    errorMessageEl.hidden = false;
+    srUpdateErrorStatus(errorMessageSrOnlyEl, false);
+  } else if (backspacePressed) {
+    // clear error
+    errorMessageEl.hidden = true;
+    srUpdateErrorStatus(errorMessageSrOnlyEl, true);
+  } else if (matchType === "letter" && shiftComboPressed) {
+    // hides error when input should be a letter and key combo is a letter
+    errorMessageEl.hidden = true;
+    srUpdateErrorStatus(errorMessageSrOnlyEl, true);
+  } else if (valueAttempt.length === newValue.length && inputAddedByPaste) {
+    // input accepted when added with copy/paste
+    errorMessageEl.hidden = true;
+    srUpdateErrorStatus(errorMessageSrOnlyEl, true);
+  } else if (valueAttempt.length === newValue.length && !formatCharAdded) {
+    // input rejected but a format character was added
+    errorMessageEl.hidden = false;
+    srUpdateErrorStatus(errorMessageSrOnlyEl, false);
+  } else if (valueAttempt.length > newValue.length) {
+    // input rejected and no character was added
+    errorMessageEl.hidden = false;
+    srUpdateErrorStatus(errorMessageSrOnlyEl, false);
+  } else if (valueAttempt.length <= newValue.length) {
+    // input accepted with new character added
+    errorMessageEl.hidden = true;
+    srUpdateErrorStatus(errorMessageSrOnlyEl, true);
+  }
+
+  // set error messages text
+  switch (messageType) {
+    case "letter":
+      errorMessageEl.textContent = errorMsgAlpha;
+      srUpdateErrorMsg(errorMessageSrOnlyEl, errorMsgAlphaSrOnly);
+      break;
+    case "number":
+      errorMessageEl.textContent = errorMsgNum;
+      srUpdateErrorMsg(errorMessageSrOnlyEl, errorMsgNumSrOnly);
+      break;
+    case "input full":
+      errorMessageEl.textContent = errorMsgFull;
+      srUpdateErrorMsg(errorMessageSrOnlyEl, errorMsgFullSrOnly);
+      break;
+    default:
+      errorMessageEl.textContent = errorMsg;
+      srUpdateErrorMsg(errorMessageSrOnlyEl, errorMsgSrOnly);
+  }
+};
+
+/**
+ *  Gets the processed input value and puts it inside the mask element.
+ *  Triggers error handling.
+ *
+ * @param {HTMLElement} e - The input element
+ */
+const handleValueChange = (e) => {
+  keyPressed = e.key;
+  let maxLengthReached;
+  const inputEl = e.srcElement;
+
+  // record potential new value before new character is accepted or rejected
+  const valueAttempt = inputEl.value;
+
+  // check if max character count has been reached
+  if (!backspacePressed) {
+    maxLengthReached = lastValueLength === inputEl.maxLength;
+  } else {
+    maxLengthReached = false;
+  }
+
+  // get processed new value and expected character type
+  const { newValue, matchType } = handleCurrentValue(inputEl);
+  inputEl.value = newValue;
+
+  // save new value length as lastValueLength for next input check
+  lastValueLength = newValue.length;
+
+  const maskVal = setValueOfMask(inputEl);
+  const maskEl = document.getElementById(`${inputEl.id}Mask`);
   maskEl.textContent = "";
   maskEl.replaceChildren(maskVal[0], maskVal[1]);
+
+  handleErrorState(
+    valueAttempt,
+    newValue,
+    matchType,
+    inputEl,
+    maxLengthReached,
+  );
+};
+
+const keyUpCheck = (e) => {
+// run handleValueChange() only when backspacing, clearing input, or pressing a non-CapsLock key
+// at a standard location, to avoid errors from CapsLock or Shift key combos triggering the function twice
+  if (backspacePressed) {
+    handleValueChange(e);
+  } else if (e.key !== "CapsLock" && e.location === 0) {
+    handleValueChange(e);
+  }
+};
+
+const keyDownCheck = (e) => {
+  if (e.shiftKey && /^[a-zA-Z]$/.test(e.key)) {
+    shiftComboPressed = true;
+  } else {
+    shiftComboPressed = false;
+  }
+
+  if (e.key === 'Backspace' || (e.metaKey && e.key === 'Backspace')) {
+    backspacePressed = true;
+  } else {
+    backspacePressed = false;
+  }
 };
 
 const inputMaskEvents = {
   keyup: {
-    [MASKED]() {
-      handleValueChange(this);
+    [MASKED](e) {
+      keyUpCheck(e);
+    },
+  },
+  keydown: {
+    [MASKED](e) {
+      keyDownCheck(e);
     },
   },
 };
